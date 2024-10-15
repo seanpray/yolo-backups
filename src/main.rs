@@ -355,27 +355,30 @@ struct Config {
     connections: Vec<Client>,
 }
 
-impl Config {
-    pub async fn send_webhook(&self, message: &str) -> Result<(), Box<dyn Error>> {
-        for webhook in &self.notification_webhook {
-            let client = reqwest::ClientBuilder::new()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap_or_default();
-            let _ = client
-                .post(webhook)
-                .header(
-                    HeaderName::from_str("Content-type").unwrap(),
-                    HeaderValue::from_str("application/json").unwrap(),
-                )
-                .body(serde_json::to_string(
-                    &json!({ "content": format!("[{} Node] {message}", self.alias) }),
-                )?)
-                .send()
-                .await;
-        }
-        Ok(())
+/* would be better to take &self, but ownership issues with aysnc move */
+pub async fn send_webhook(
+    webhooks: &[String],
+    message: &str,
+    alias: &str,
+) -> Result<(), Box<dyn Error>> {
+    for webhook in webhooks {
+        let client = reqwest::ClientBuilder::new()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        let _ = client
+            .post(webhook)
+            .header(
+                HeaderName::from_str("Content-type").unwrap(),
+                HeaderValue::from_str("application/json").unwrap(),
+            )
+            .body(serde_json::to_string(
+                &json!({ "content": format!("[{} Node] {message}", alias) }),
+            )?)
+            .send()
+            .await;
     }
+    Ok(())
 }
 
 include!(concat!(env!("OUT_DIR"), "/version.rs"));
@@ -400,44 +403,51 @@ async fn main() -> Result<(), Box<dyn Error>> {
         dbg!(client.get_latest_entry().await);
         dbg!("finished getting latest file");
     }
+    let webhooks = Arc::new(config.notification_webhook);
     while config.connections.len() > 0 {
         if let Some(client) = config.connections.pop() {
-        let config = Arc::new(config).clone();
-        tokio::spawn(async move {
-            if let Some(backup_interval) = client.interval_sec {
-                loop {
-                    dbg!("iter");
-                    if config.notify_on_start.unwrap_or_default() {
-                        let _ = config
-                            .send_webhook(&format!(
-                                "Starting scheduled backed for {}",
-                                client.alias
-                            ))
+            let webhooks = webhooks.clone();
+            tokio::spawn(async move {
+                if let Some(backup_interval) = client.interval_sec {
+                    loop {
+                        dbg!("iter");
+                        if config.notify_on_start.unwrap_or_default() {
+                            let _ = send_webhook(
+                                &webhooks,
+                                &format!("Starting scheduled backed for {}", client.alias),
+                                &client.alias,
+                            )
                             .await;
-                    }
-                    if let Ok(v) = client.backup().await {
-                        if config.notify_on_end.unwrap_or_default() {
-                            let _ = config
-                                .send_webhook(&format!(
-                                    "Successfully backed up {}, message: {v}",
-                                    client.alias
-                                ))
-                                .await;
-                            continue;
                         }
+                        if let Ok(v) = client.backup().await {
+                            if config.notify_on_end.unwrap_or_default() {
+                                let _ = send_webhook(
+                                    &webhooks,
+                                    &format!(
+                                        "Successfully backed up {}, message: {v}",
+                                        client.alias
+                                    ),
+                                    &client.alias,
+                                )
+                                .await;
+                                continue;
+                            }
+                        }
+                        if config.notify_on_fail.unwrap_or_default() {
+                            let _ = send_webhook(
+                                &webhooks,
+                                &format!("Failed: {}", client.alias),
+                                &client.alias,
+                            )
+                            .await;
+                        }
+                        let deletion_message = client.delete_old_backups().await;
+                        if let Ok(v) = deletion_message {}
+                        park_timeout(Duration::from_secs(backup_interval as u64))
                     }
-                    if config.notify_on_fail.unwrap_or_default() {
-                        let _ = config.send_webhook(&format!("Failed: {}", client.alias)).await;
-                    }
-                    let deletion_message = client.delete_old_backups().await;
-                    if let Ok(v) = deletion_message {
-
-                    }
-                    park_timeout(Duration::from_secs(backup_interval as u64))
                 }
-            }
-        });
-            }
+            });
+        }
     }
     Ok(())
 }
