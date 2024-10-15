@@ -69,10 +69,10 @@ struct Client {
     required_suffix: Option<String>,
     // prefix that is required when trying to find latest folder
     required_prefix: Option<String>,
-    // detault true
+    // default true
     archive: Option<bool>,
-    // detaul true
-    compress: Option<bool>,
+    // default 3
+    compression_level: Option<u8>,
     local_path: String,
     port: Option<u16>,
     interval_sec: Option<usize>,
@@ -227,6 +227,24 @@ impl Client {
         }
     }
 
+    fn exec_rsync(&self, backup_name: &str) -> impl Stream<Item = String> {
+        exec_stream(
+            "rsync",
+            &[
+                "-e",
+                &format!("ssh -p {}", self.port.unwrap_or(22)),
+                "-avzh",
+                &format!("--timeout={}", self.timeout.unwrap_or(10)),
+                &format!("--bwlimit={}", self.bandwidth_limit_mb * 1024),
+                &format!(
+                    "{}@{}:{}{}",
+                    self.remote_user, self.remote_host, self.remote_folder, backup_name,
+                ),
+                &format!("{}{}/", self.local_path, self.alias),
+            ],
+        )
+    }
+
     async fn backup(&self) -> Result<String, String> {
         let path = format!("{}{}", self.local_path, self.alias);
         let Ok(size) = get_size(path) else {
@@ -239,22 +257,8 @@ impl Client {
             ));
         }
         // TODO compress-level
-        if let Some(v) = &self.backup_name {
-            let s = exec_stream(
-                "rsync",
-                &[
-                    "-e",
-                    &format!("ssh -p {}", self.port.unwrap_or(22)),
-                    "-avzh",
-                    &format!("--timeout={}", self.timeout.unwrap_or(10)),
-                    &format!("--bwlimit={}", self.bandwidth_limit_mb * 1024),
-                    &format!(
-                        "{}@{}:{}{}",
-                        self.remote_user, self.remote_host, self.remote_folder, v
-                    ),
-                    &format!("{}{}/", self.local_path, self.alias),
-                ],
-            );
+        if let Some(backup_name) = &self.backup_name {
+            let s = self.exec_rsync(backup_name);
             dbg!("test2");
             let s = s.peekable();
             pin_mut!(s);
@@ -289,21 +293,8 @@ impl Client {
             return Ok(res);
         }
 
-        if let Some(v) = self.get_latest_entry().await {
-            let s = exec_stream(
-                "rsync",
-                &[
-                    "-e",
-                    &format!("ssh -p {}", self.port.unwrap_or(22)),
-                    "-avzh",
-                    &format!("--timeout={}", self.timeout.unwrap_or(10)),
-                    &format!(
-                        "{}@{}:{}{}",
-                        self.remote_user, self.remote_host, self.remote_folder, v
-                    ),
-                    &format!("{}{}/", self.local_path, self.alias),
-                ],
-            );
+        if let Some(latest) = self.get_latest_entry().await {
+            let s = self.exec_rsync(&latest);
             dbg!("test3");
             let s = s.peekable();
             pin_mut!(s);
@@ -329,7 +320,7 @@ impl Client {
                 let s = exec_stream(
                     "mv",
                     &[&format!(
-                        "{}{}/{v} {}{}/{backup_name}",
+                        "{}{}/{latest} {}{}/{backup_name}",
                         self.local_path, self.alias, self.local_path, self.alias
                     )],
                 );
@@ -404,7 +395,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         dbg!("finished getting latest file");
     }
     let webhooks = Arc::new(config.notification_webhook);
-    while config.connections.len() > 0 {
+    while !config.connections.is_empty() {
         if let Some(client) = config.connections.pop() {
             let webhooks = webhooks.clone();
             tokio::spawn(async move {
