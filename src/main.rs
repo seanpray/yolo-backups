@@ -14,7 +14,7 @@ use std::io::Error as ioError;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::thread::{park_timeout, sleep};
+use std::thread::park_timeout;
 use std::time::{Duration, SystemTime};
 use std::{error::Error, fs::read_to_string, path::Path, process::Stdio};
 use tokio::{
@@ -71,8 +71,6 @@ struct Client {
     required_prefix: Option<String>,
     // default true
     archive: Option<bool>,
-    // default 3
-    compression_level: Option<u8>,
     local_path: String,
     port: Option<u16>,
     interval_sec: Option<usize>,
@@ -236,6 +234,7 @@ impl Client {
                 "-avzh",
                 &format!("--timeout={}", self.timeout.unwrap_or(10)),
                 &format!("--bwlimit={}", self.bandwidth_limit_mb * 1024),
+                "--compress",
                 &format!(
                     "{}@{}:{}{}",
                     self.remote_user, self.remote_host, self.remote_folder, backup_name,
@@ -256,10 +255,8 @@ impl Client {
                 self.alias
             ));
         }
-        // TODO compress-level
         if let Some(backup_name) = &self.backup_name {
             let s = self.exec_rsync(backup_name);
-            dbg!("test2");
             let s = s.peekable();
             pin_mut!(s);
             let mut res = String::new();
@@ -269,27 +266,28 @@ impl Client {
                     res = value.to_owned();
                 }
             }
-            // if self.rename_result_ts.unwrap_or_default() {
-            //     let now: DateTime<Local> = Local::now();
-            //     let backup_name = &format!(
-            //         "{}_{:0>4}-{:0>2}-{:0>2}_{:0>2}_{:0>2}_{:0>2}",
-            //         self.alias,
-            //         now.year(),
-            //         now.month(),
-            //         now.day(),
-            //         now.hour(),
-            //         now.minute(),
-            //         now.second()
-            //     );
-            //     let s = exec_stream(
-            //         "mv",
-            //         &[
-            //             &format!("{}{}/{v} {}{}/{backup_name}", self.local_path, self.alias, self.local_path, self.alias)
-            //         ],
-            //     );
-            //     pin_mut!(s);
-            //     let _ = s;
-            // }
+            if self.rename_result_ts.unwrap_or_default() {
+                let now: DateTime<Local> = Local::now();
+                let formatted_backup_name = &format!(
+                    "{}_{:0>4}-{:0>2}-{:0>2}_{:0>2}_{:0>2}_{:0>2}",
+                    self.alias,
+                    now.year(),
+                    now.month(),
+                    now.day(),
+                    now.hour(),
+                    now.minute(),
+                    now.second()
+                );
+                let s = exec_stream(
+                    "mv",
+                    &[&format!(
+                        "{}{}/{backup_name} {}{}/{formatted_backup_name}",
+                        self.local_path, self.alias, self.local_path, self.alias
+                    )],
+                );
+                pin_mut!(s);
+                let _ = s;
+            }
             return Ok(res);
         }
 
@@ -395,9 +393,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         dbg!("finished getting latest file");
     }
     let webhooks = Arc::new(config.notification_webhook);
+    let node_alias = Arc::new(config.alias);
     while !config.connections.is_empty() {
         if let Some(client) = config.connections.pop() {
+            // for cases with almost no content Arc<String>/Arc<str> is better than cloning
             let webhooks = webhooks.clone();
+            let node_alias = node_alias.clone();
             tokio::spawn(async move {
                 if let Some(backup_interval) = client.interval_sec {
                     loop {
@@ -418,7 +419,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         "Successfully backed up {}, message: {v}",
                                         client.alias
                                     ),
-                                    &client.alias,
+                                    &node_alias,
                                 )
                                 .await;
                                 continue;
@@ -428,12 +429,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             let _ = send_webhook(
                                 &webhooks,
                                 &format!("Failed: {}", client.alias),
-                                &client.alias,
+                                &node_alias,
                             )
                             .await;
                         }
                         let deletion_message = client.delete_old_backups().await;
-                        if let Ok(v) = deletion_message {}
+                        if config.notify_on_delete.unwrap_or_default() {
+                            let _ = send_webhook(
+                                &webhooks,
+                                &deletion_message.unwrap_or_else(|e| e.to_string()),
+                                &node_alias,
+                            )
+                            .await;
+                        }
                         park_timeout(Duration::from_secs(backup_interval as u64))
                     }
                 }
