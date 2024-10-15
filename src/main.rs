@@ -1,26 +1,27 @@
 use async_stream::stream;
-use serde_json::json;
-use chrono::{TimeZone, Local, Datelike, Timelike};
 use chrono::{DateTime, Utc};
+use chrono::{Datelike, Local, TimeZone, Timelike};
+use clap::Parser;
 use fs_extra::dir::get_size;
 use futures_core::stream::Stream;
 use futures_util::pin_mut;
 use futures_util::stream::StreamExt;
 use reqwest::header::{HeaderName, HeaderValue};
 use serde::Deserialize;
-use std::fs::create_dir_all;
+use serde_json::json;
+use std::fs::{create_dir_all, remove_dir_all, remove_file};
+use std::io::Error as ioError;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::thread::sleep;
+use std::sync::Arc;
+use std::thread::{park_timeout, sleep};
 use std::time::{Duration, SystemTime};
 use std::{error::Error, fs::read_to_string, path::Path, process::Stdio};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
 };
-use clap::Parser;
 
-/// Simple program to greet a person
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -144,14 +145,19 @@ impl Client {
         directories.into_iter().map(|(n, _ts)| n).nth(0)
     }
 
-    async fn delete_old_backups(&self) {
+    async fn delete_old_backups(&self) -> Result<String, ioError> {
         let dir = PathBuf::from(format!("{}{}", self.local_path, self.alias));
         if !dir.exists() {
-            return;
+            return Ok(format!("Directory {} does not exist", self.local_path));
         }
         let backups = match dir.read_dir() {
             Ok(v) => v,
-            Err(_) => return,
+            Err(_) => {
+                return Ok(format!(
+                    "Failed to read directory entries {}",
+                    self.local_path
+                ))
+            }
         };
         let mut backups_list = Vec::new();
         for backup in backups.flatten() {
@@ -175,11 +181,49 @@ impl Client {
                         continue;
                     }
                 }
-                backups_list.push((fname, elapsed));
+                backups_list.push((fname, elapsed, m.is_dir()));
             }
         }
-        if self.backup_count > backups_list.len() {
-            
+        if self.backup_count <= backups_list.len() {
+            return Ok(format!(
+                "No backups to remove! [{}/{}]",
+                backups_list.len(),
+                self.backup_count
+            ));
+        }
+        backups_list.sort_by_key(|x| x.1);
+
+        let new_backups_count = backups_list.len() - self.backup_count;
+        let mut removed = Vec::with_capacity(new_backups_count);
+        for _ in 0..new_backups_count {
+            if let Some((backup, time, dir)) = &backups_list.pop() {
+                removed.push(format!(
+                    "{} \t\tcreation elapsed (seconds): {}",
+                    backup,
+                    time.as_secs()
+                ));
+                if *dir {
+                    remove_dir_all(backup)?;
+                } else {
+                    remove_file(backup)?;
+                }
+            }
+        }
+        if new_backups_count > 0 {
+            Ok(format!(
+                "```Removed:\n{}\nRemaining:\n{}```",
+                removed.join("\n"),
+                backups_list
+                    .iter()
+                    .map(|(path, age, _)| format!(
+                        "{path} \t\t creation elapsed (seconds): {}",
+                        age.as_secs()
+                    ))
+                    .collect::<Vec<String>>()
+                    .join("\n")
+            ))
+        } else {
+            unreachable!()
         }
     }
 
@@ -284,17 +328,19 @@ impl Client {
                 );
                 let s = exec_stream(
                     "mv",
-                    &[
-                        &format!("{}{}/{v} {}{}/{backup_name}", self.local_path, self.alias, self.local_path, self.alias)
-                    ],
+                    &[&format!(
+                        "{}{}/{v} {}{}/{backup_name}",
+                        self.local_path, self.alias, self.local_path, self.alias
+                    )],
                 );
                 pin_mut!(s);
                 let _ = s;
             }
             return Ok(res);
-
         }
-        Ok(String::from("no backup method was set for scheduled backup"))
+        Ok(String::from(
+            "no backup method was set for scheduled backup",
+        ))
     }
 }
 
@@ -305,6 +351,7 @@ struct Config {
     notify_on_start: Option<bool>,
     notify_on_end: Option<bool>,
     notify_on_fail: Option<bool>,
+    notify_on_delete: Option<bool>,
     connections: Vec<Client>,
 }
 
@@ -321,9 +368,9 @@ impl Config {
                     HeaderName::from_str("Content-type").unwrap(),
                     HeaderValue::from_str("application/json").unwrap(),
                 )
-                .body(
-                    serde_json::to_string(&json!({ "content": format!("[{} Node] {message}", self.alias) }))?,
-                )
+                .body(serde_json::to_string(
+                    &json!({ "content": format!("[{} Node] {message}", self.alias) }),
+                )?)
                 .send()
                 .await;
         }
@@ -337,7 +384,7 @@ include!(concat!(env!("OUT_DIR"), "/version.rs"));
 async fn main() -> Result<(), Box<dyn Error>> {
     println!("starting backup system, {VERSION}");
     println!("reading config");
-    let config: Config = serde_yaml::from_str(&read_to_string("./config.yml")?)?;
+    let mut config: Config = serde_yaml::from_str(&read_to_string("./config.yml")?)?;
     for client in &config.connections {
         println!(
             "checking if local_path backup directory exists for {}...",
@@ -353,34 +400,44 @@ async fn main() -> Result<(), Box<dyn Error>> {
         dbg!(client.get_latest_entry().await);
         dbg!("finished getting latest file");
     }
-    // tokio::spawn(async move {
-    // });
-    let mut counter: usize = 0;
-    dbg!("iter start");
-    loop {
-        // tokio::time::sleep(Duration::from_secs(1)).await;
-        sleep(Duration::from_secs(1));
-        counter = counter.wrapping_add(1);
-        dbg!("iter");
-        for client in &config.connections {
-            if let Some(v) = client.interval_sec {
-                if counter % v == 0 {
+    while config.connections.len() > 0 {
+        if let Some(client) = config.connections.pop() {
+        let config = Arc::new(config).clone();
+        tokio::spawn(async move {
+            if let Some(backup_interval) = client.interval_sec {
+                loop {
+                    dbg!("iter");
                     if config.notify_on_start.unwrap_or_default() {
-                        let _ = config.send_webhook(&format!("Starting scheduled backed for {}", client.alias)).await;
+                        let _ = config
+                            .send_webhook(&format!(
+                                "Starting scheduled backed for {}",
+                                client.alias
+                            ))
+                            .await;
                     }
                     if let Ok(v) = client.backup().await {
                         if config.notify_on_end.unwrap_or_default() {
-                            let _ = config.send_webhook(&format!("Successfully backed up {}, message: {v}", client.alias)).await;
+                            let _ = config
+                                .send_webhook(&format!(
+                                    "Successfully backed up {}, message: {v}",
+                                    client.alias
+                                ))
+                                .await;
                             continue;
                         }
                     }
                     if config.notify_on_fail.unwrap_or_default() {
-                        let _ = config.send_webhook(&format!("Failed: {v}")).await;
+                        let _ = config.send_webhook(&format!("Failed: {}", client.alias)).await;
                     }
+                    let deletion_message = client.delete_old_backups().await;
+                    if let Ok(v) = deletion_message {
+
+                    }
+                    park_timeout(Duration::from_secs(backup_interval as u64))
                 }
             }
-        }
+        });
+            }
     }
-    // TODO future rest api or smth to measure backup system health
-    // park();
+    Ok(())
 }
