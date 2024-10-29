@@ -256,6 +256,7 @@ impl Client {
             ));
         }
         if let Some(backup_name) = &self.backup_name {
+            dbg!("rsync");
             let s = self.exec_rsync(backup_name);
             let s = s.peekable();
             pin_mut!(s);
@@ -382,15 +383,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "checking if local_path backup directory exists for {}...",
             client.alias
         );
-        if !PathBuf::from(&client.local_path).exists() {
+        let path = format!("{}{}", client.local_path, client.alias);
+        if !PathBuf::from(&path).exists() {
             println!("local_path backup directory doesn't exists, attempting to create");
             create_dir_all(&client.local_path).expect("failed to create backup folder");
         }
         println!("creating alias directory inside local_path");
-        create_dir_all(format!("{}{}", client.local_path, client.alias))
+        create_dir_all(&path)
             .expect("failed to alias backup folder");
-        dbg!(client.get_latest_entry().await);
-        dbg!("finished getting latest file");
     }
     let webhooks = Arc::new(config.notification_webhook);
     let node_alias = Arc::new(config.alias);
