@@ -14,9 +14,9 @@ use std::io::Error as ioError;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::thread::park_timeout;
 use std::time::{Duration, SystemTime};
 use std::{error::Error, fs::read_to_string, path::Path, process::Stdio};
+use tokio::time::sleep;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
@@ -104,7 +104,7 @@ impl Client {
         while let Some(value) = s.next().await {
             let value_split: Vec<&str> = value.split_whitespace().collect();
             if value_split.len() < 5 {
-                dbg!("{value}");
+                // dbg!("{value}");
                 continue;
             }
             let dt_str = &value_split[2..4].join(" ");
@@ -144,7 +144,7 @@ impl Client {
     }
 
     async fn delete_old_backups(&self) -> Result<String, ioError> {
-        let dir = PathBuf::from(format!("{}{}", self.local_path, self.alias));
+        let dir = PathBuf::from(format!("{}{}/", self.local_path, self.alias));
         if !dir.exists() {
             return Ok(format!("Directory {} does not exist", self.local_path));
         }
@@ -182,7 +182,7 @@ impl Client {
                 backups_list.push((fname, elapsed, m.is_dir()));
             }
         }
-        if self.backup_count <= backups_list.len() {
+        if self.backup_count >= backups_list.len() {
             return Ok(format!(
                 "No backups to remove! [{}/{}]",
                 backups_list.len(),
@@ -190,20 +190,31 @@ impl Client {
             ));
         }
         backups_list.sort_by_key(|x| x.1);
+        backups_list.reverse();
 
-        let new_backups_count = backups_list.len() - self.backup_count;
+        let new_backups_count = if backups_list.len() > self.backup_count {
+            backups_list.len() - self.backup_count
+        } else {
+            0
+        };
         let mut removed = Vec::with_capacity(new_backups_count);
         for _ in 0..new_backups_count {
             if let Some((backup, time, dir)) = &backups_list.pop() {
+                if let Some(interval) = self.interval_sec {
+                    if time.as_secs() < (interval * self.backup_count) as u64 {
+                        continue;
+                    }
+                }
                 removed.push(format!(
                     "{} \t\tcreation elapsed (seconds): {}",
                     backup,
                     time.as_secs()
                 ));
+                let path = format!("{}{}/{backup}", self.local_path, self.alias);
                 if *dir {
-                    remove_dir_all(backup)?;
+                    remove_dir_all(&path)?;
                 } else {
-                    remove_file(backup)?;
+                    remove_file(&path)?;
                 }
             }
         }
@@ -256,14 +267,12 @@ impl Client {
             ));
         }
         if let Some(backup_name) = &self.backup_name {
-            dbg!("rsync");
             let s = self.exec_rsync(backup_name);
             let s = s.peekable();
             pin_mut!(s);
             let mut res = String::new();
             while let Some(value) = &s.next().await {
                 if s.as_mut().peek().await.is_none() {
-                    dbg!(res);
                     res = value.to_owned();
                 }
             }
@@ -281,10 +290,10 @@ impl Client {
                 );
                 let s = exec_stream(
                     "mv",
-                    &[&format!(
-                        "{}{}/{backup_name} {}{}/{formatted_backup_name}",
-                        self.local_path, self.alias, self.local_path, self.alias
-                    )],
+                    &[
+                        &format!("{}{}/{backup_name}", self.local_path, self.alias),
+                        &format!("{}{}/{formatted_backup_name}", self.local_path, self.alias),
+                    ],
                 );
                 pin_mut!(s);
                 let _ = s;
@@ -294,13 +303,11 @@ impl Client {
 
         if let Some(latest) = self.get_latest_entry().await {
             let s = self.exec_rsync(&latest);
-            dbg!("test3");
             let s = s.peekable();
             pin_mut!(s);
             let mut res = String::new();
             while let Some(value) = &s.next().await {
                 if s.as_mut().peek().await.is_none() {
-                    dbg!(res);
                     res = value.to_owned();
                 }
             }
@@ -367,6 +374,7 @@ pub async fn send_webhook(
             )?)
             .send()
             .await;
+        sleep(Duration::from_secs(1)).await;
     }
     Ok(())
 }
@@ -383,14 +391,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "checking if local_path backup directory exists for {}...",
             client.alias
         );
-        let path = format!("{}{}", client.local_path, client.alias);
+        let path = format!("{}{}/", client.local_path, client.alias);
         if !PathBuf::from(&path).exists() {
             println!("local_path backup directory doesn't exists, attempting to create");
             create_dir_all(&client.local_path).expect("failed to create backup folder");
         }
-        println!("creating alias directory inside local_path");
-        create_dir_all(&path)
-            .expect("failed to alias backup folder");
+        println!("creating alias directory inside local_path: {path}");
+        create_dir_all(&path).expect("failed to alias backup folder");
     }
     let webhooks = Arc::new(config.notification_webhook);
     let node_alias = Arc::new(config.alias);
@@ -402,7 +409,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             tokio::spawn(async move {
                 if let Some(backup_interval) = client.interval_sec {
                     loop {
-                        dbg!("iter");
                         if config.notify_on_start.unwrap_or_default() {
                             let _ = send_webhook(
                                 &webhooks,
@@ -422,10 +428,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     &node_alias,
                                 )
                                 .await;
-                                continue;
                             }
-                        }
-                        if config.notify_on_fail.unwrap_or_default() {
+                        } else if config.notify_on_fail.unwrap_or_default() {
                             let _ = send_webhook(
                                 &webhooks,
                                 &format!("Failed: {}", client.alias),
@@ -442,11 +446,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             )
                             .await;
                         }
-                        park_timeout(Duration::from_secs(backup_interval as u64))
+                        sleep(Duration::from_secs(backup_interval as u64)).await;
                     }
                 }
             });
         }
     }
+    loop {}
     Ok(())
 }
