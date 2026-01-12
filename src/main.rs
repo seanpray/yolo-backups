@@ -190,7 +190,6 @@ impl Client {
             ));
         }
         backups_list.sort_by_key(|x| x.1);
-        backups_list.reverse();
 
         let new_backups_count = if backups_list.len() > self.backup_count {
             backups_list.len() - self.backup_count
